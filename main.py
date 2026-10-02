@@ -3,10 +3,10 @@ from fastapi.middleware.cors import CORSMiddleware
 from sqlalchemy import create_engine, Column, Integer, String, DateTime
 from sqlalchemy.orm import declarative_base, sessionmaker, Session
 from pydantic import BaseModel
-from passlib.context import CryptContext
 from datetime import datetime, timedelta
 from openai import OpenAI
 import jwt
+import bcrypt
 import os
 from dotenv import load_dotenv
 
@@ -37,7 +37,6 @@ class QuestionLog(Base):
     question_text = Column(String)
     created_at = Column(DateTime, default=datetime.utcnow)
 
-# SAFELY create tables so the server doesn't crash on boot!
 try:
     Base.metadata.create_all(bind=engine)
 except Exception as e:
@@ -46,7 +45,6 @@ except Exception as e:
 # --- SECURITY & AUTH ---
 SECRET_KEY = os.getenv("SECRET_KEY", "super_secret_draft_key_2026")
 ALGORITHM = "HS256"
-pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
 
 def get_db():
     db = SessionLocal()
@@ -104,7 +102,10 @@ def register(req: AuthRequest, db: Session = Depends(get_db)):
         if existing_user:
             raise HTTPException(status_code=400, detail="Username already drafted.")
         
-        hashed_pw = pwd_context.hash(req.password)
+        # USE BCRYPT DIRECTLY (Fixed Passlib Bug)
+        salt = bcrypt.gensalt()
+        hashed_pw = bcrypt.hashpw(req.password.encode('utf-8'), salt).decode('utf-8')
+        
         new_user = User(username=req.username, password_hash=hashed_pw)
         db.add(new_user)
         db.commit()
@@ -112,14 +113,15 @@ def register(req: AuthRequest, db: Session = Depends(get_db)):
     except HTTPException:
         raise
     except Exception as e:
-        # This will send the exact PostgreSQL error to the React frontend!
         raise HTTPException(status_code=500, detail=f"Database Connection Error: {str(e)}")
 
 @app.post("/login")
 def login(req: AuthRequest, db: Session = Depends(get_db)):
     try:
         user = db.query(User).filter(User.username == req.username).first()
-        if not user or not pwd_context.verify(req.password, user.password_hash):
+        
+        # USE BCRYPT DIRECTLY TO VERIFY
+        if not user or not bcrypt.checkpw(req.password.encode('utf-8'), user.password_hash.encode('utf-8')):
             raise HTTPException(status_code=401, detail="Incorrect username or password.")
         
         token_expires = datetime.utcnow() + timedelta(hours=24)
