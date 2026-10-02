@@ -1,25 +1,55 @@
-from openai import OpenAI
-import os
-import openai
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
+from pydantic import BaseModel
+from openai import OpenAI
 from dotenv import load_dotenv
+import os
+
 load_dotenv()
-client = OpenAI()
+client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
+
 app = FastAPI()
+
 app.add_middleware(
     CORSMiddleware,
-    allow_origins = ["*"],
+    allow_origins=["*"],
     allow_credentials=False,
-    allow_methods = ["*"],
+    allow_methods=["*"],
     allow_headers=["*"],
 )
-@app.get("/generate_question")
-def genrate_question():
-    system_prompt = "your the an expext in the data science with around 60 years of experience in the field who still study till today always been upto date in the market teacher for data science students and teaches clearly and ask frame quetion in a invative way were it make students to think hard of the concept which in the industry gives them edge in the feild when they get into the market for jobs in the field of data science and AI "
-    user_prompt = "generate one innovative and highly challenging data science interview question ."
-    messages = [{"role":"system","content":system_prompt},
-                {"role":"user","content":user_prompt}]
-    response = client.chat.completions.create(model="gpt-3.5-turbo",messages=messages)
+
+# This defines the data React will send to Python
+class QuestionRequest(BaseModel):
+    topic: str
+    difficulty: str
+    history: list[str] = []
+
+@app.post("/generate_question")
+def generate_question(req: QuestionRequest):
+    # Core Persona
+    system_prompt = (
+        "You are an expert Data Science interviewer with 60 years of experience. "
+        "You ask innovative, highly challenging questions that give students a competitive edge. "
+        "Do NOT include any introductions, explanations, or meta-commentary. Output ONLY the exact interview question."
+    )
+    
+    # Specific Instructions based on the UI
+    user_prompt = f"Topic: {req.topic}\nTarget Difficulty Level: {req.difficulty}\n\n"
+    
+    # Prevent Repetition
+    if req.history:
+        user_prompt += "IMPORTANT: Do NOT ask any of these previously asked questions:\n"
+        for q in req.history:
+            user_prompt += f"- {q[:150]}...\n" # Truncate to save AI memory
+        user_prompt += "\nGenerate a completely NEW question based on the topic and difficulty."
+    else:
+        user_prompt += "Generate a new question based on the topic and difficulty."
+
+    messages = [
+        {"role": "system", "content": system_prompt},
+        {"role": "user", "content": user_prompt}
+    ]
+    
+    response = client.chat.completions.create(model="gpt-3.5-turbo", messages=messages)
     responses = response.choices[0].message.content
     return {"question": responses}
