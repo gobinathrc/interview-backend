@@ -1,6 +1,5 @@
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
 from openai import OpenAI
 from dotenv import load_dotenv
@@ -25,11 +24,11 @@ class QuestionRequest(BaseModel):
     history: list[str] = []
 
 @app.post("/generate_question")
-async def generate_question(req: QuestionRequest):
+def generate_question(req: QuestionRequest):
     system_prompt = (
         "You are an expert Data Science interviewer. "
         "You ask innovative, highly challenging questions. "
-        "Do NOT include any introductions, explanations, or meta-commentary. Output ONLY the exact interview question."
+        "Do NOT include introductions, explanations, or meta-commentary. Output ONLY the exact interview question."
     )
     
     user_prompt = f"Topic: {req.topic}\nTarget Difficulty Level: {req.difficulty}\n\n"
@@ -47,18 +46,14 @@ async def generate_question(req: QuestionRequest):
         {"role": "user", "content": user_prompt}
     ]
     
-    # Generator function to yield words as they arrive
-    def event_generator():
+    try:
         response = client.chat.completions.create(
-            model="gpt-4o-mini", # Fastest model
+            model="gpt-4o-mini",
             messages=messages,
             max_tokens=150,
-            temperature=0.7,
-            stream=True # THIS ENABLES STREAMING
+            temperature=0.7
         )
-        for chunk in response:
-            content = chunk.choices[0].delta.content
-            if content:
-                yield content
-
-    return StreamingResponse(event_generator(), media_type="text/event-stream")
+        return {"question": response.choices[0].message.content}
+    except Exception as e:
+        # If OpenAI fails, return the error safely as text
+        return {"question": f"OPENAI ERROR: {str(e)}"}
