@@ -9,6 +9,7 @@ import jwt
 import bcrypt
 import os
 from dotenv import load_dotenv
+import time
 
 load_dotenv()
 
@@ -56,24 +57,43 @@ def get_db():
 def get_current_user(request: Request, db: Session = Depends(get_db)):
     auth_header = request.headers.get("Authorization")
     if not auth_header or not auth_header.startswith("Bearer "):
-        raise HTTPException(status_code=401, detail="Unauthorized. Please log in.")
+        raise HTTPException(status_code=401, detail="Missing Auth Header")
     
     token = auth_header.split(" ")[1]
     try:
         payload = jwt.decode(token, SECRET_KEY, algorithms=[ALGORITHM])
         user_id = payload.get("sub")
         if user_id is None:
-            raise HTTPException(status_code=401, detail="Invalid token.")
-    except jwt.PyJWTError:
-        raise HTTPException(status_code=401, detail="Invalid token.")
+            raise HTTPException(status_code=401, detail="Token missing ID.")
+    except Exception as e:
+        # This will catch exact token errors (like expired signature)
+        raise HTTPException(status_code=401, detail=f"JWT Error: {str(e)}")
         
     try:
-        user = db.query(User).filter(User.id == user_id).first()
+        # Force convert back to integer for database safety
+        user = db.query(User).filter(User.id == int(user_id)).first()
         if not user:
-            raise HTTPException(status_code=401, detail="User not found.")
+            raise HTTPException(status_code=401, detail="User no longer in DB.")
         return user
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"DB Error: {str(e)}")
+@app.post("/login")
+def login(req: AuthRequest, db: Session = Depends(get_db)):
+    try:
+        user = db.query(User).filter(User.username == req.username).first()
+        
+        if not user or not bcrypt.checkpw(req.password.encode('utf-8'), user.password_hash.encode('utf-8')):
+            raise HTTPException(status_code=401, detail="Incorrect username or password.")
+        
+        # Use simple unix timestamp (seconds) to prevent timezone bugs
+        expiration_timestamp = int(time.time()) + 86400  # Valid for exactly 24 hours
+        token = jwt.encode({"sub": str(user.id), "exp": expiration_timestamp}, SECRET_KEY, algorithm=ALGORITHM)
+        
+        return {"access_token": token, "username": user.username}
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Login DB Error: {str(e)}")
 
 # --- FASTAPI SETUP ---
 app = FastAPI()
