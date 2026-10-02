@@ -1,35 +1,49 @@
+"""
+======================================================================
+NFL DRAFT: DATA SCIENCE INTERVIEW PLATFORM - BACKEND API
+======================================================================
+This module powers the FastAPI backend for the Data Science Draft app.
+It integrates PostgreSQL for franchise history tracking, OpenAI for 
+dynamic question generation, and PyJWT/bcrypt for secure Front Office
+authentication.
+======================================================================
+"""
+import os
+import time
+import bcrypt
+import jwt
+from datetime import datetime, timedelta
+from dotenv import load_dotenv
+
 from fastapi import FastAPI, Depends, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
 from sqlalchemy import create_engine, Column, Integer, String, DateTime
 from sqlalchemy.orm import declarative_base, sessionmaker, Session
 from pydantic import BaseModel
-from datetime import datetime, timedelta
 from openai import OpenAI
-import jwt
-import bcrypt
-import os
-from dotenv import load_dotenv
-import time
 
+# 1. Environment & DB Initialization
 load_dotenv()
 
-# --- DATABASE SETUP ---
-DATABASE_URL = os.getenv("DATABASE_URL", "sqlite:///./local_draft.db")
-if DATABASE_URL.startswith("postgres://"):
-    DATABASE_URL = DATABASE_URL.replace("postgres://", "postgresql://", 1)
+# Render PostgreSQL Database URL adjustment
+RAW_DB_URL = os.getenv("DATABASE_URL", "sqlite:///./local_draft.db")
+if RAW_DB_URL.startswith("postgres://"):
+    CLEAN_DB_URL = RAW_DB_URL.replace("postgres://", "postgresql://", 1)
+else:
+    CLEAN_DB_URL = RAW_DB_URL
 
-engine = create_engine(DATABASE_URL)
-SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
-Base = declarative_base()
+draft_db_engine = create_engine(CLEAN_DB_URL)
+DraftSessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=draft_db_engine)
+DraftBase = declarative_base()
 
-# --- DATABASE MODELS ---
-class User(Base):
+# 2. Database Models
+class GMFranchise(DraftBase):
     __tablename__ = "users"
     id = Column(Integer, primary_key=True, index=True)
     username = Column(String, unique=True, index=True)
     password_hash = Column(String)
 
-class QuestionLog(Base):
+class ProspectScoutingLog(DraftBase):
     __tablename__ = "question_logs"
     id = Column(Integer, primary_key=True, index=True)
     user_id = Column(Integer, index=True)
@@ -38,66 +52,50 @@ class QuestionLog(Base):
     question_text = Column(String)
     created_at = Column(DateTime, default=datetime.utcnow)
 
+# Boot-time table creation with safety net
 try:
-    Base.metadata.create_all(bind=engine)
-except Exception as e:
-    print(f"FATAL DB ERROR ON BOOT: {e}")
+    DraftBase.metadata.create_all(bind=draft_db_engine)
+except Exception as boot_err:
+    print(f"CRITICAL BOOT ERROR - DB CONNECTION FAILED: {boot_err}")
 
-# --- SECURITY & AUTH ---
-SECRET_KEY = os.getenv("SECRET_KEY", "super_secret_draft_key_2026")
-ALGORITHM = "HS256"
+# 3. Security Config
+JWT_SECRET = os.getenv("SECRET_KEY", "super_secret_draft_key_2026")
+JWT_ALGO = "HS256"
 
-def get_db():
-    db = SessionLocal()
+# 4. Dependency Injection
+def fetch_postgres_session():
+    db_session = DraftSessionLocal()
     try:
-        yield db
+        yield db_session
     finally:
-        db.close()
+        db_session.close()
 
-def get_current_user(request: Request, db: Session = Depends(get_db)):
+def verify_front_office_token(request: Request, db: Session = Depends(fetch_postgres_session)):
     auth_header = request.headers.get("Authorization")
     if not auth_header or not auth_header.startswith("Bearer "):
-        raise HTTPException(status_code=401, detail="Missing Auth Header")
+        raise HTTPException(status_code=401, detail="Missing or invalid authentication header.")
     
-    token = auth_header.split(" ")[1]
+    raw_token = auth_header.split(" ")[1]
     try:
-        payload = jwt.decode(token, SECRET_KEY, algorithms=[ALGORITHM])
-        user_id = payload.get("sub")
-        if user_id is None:
-            raise HTTPException(status_code=401, detail="Token missing ID.")
-    except Exception as e:
-        # This will catch exact token errors (like expired signature)
-        raise HTTPException(status_code=401, detail=f"JWT Error: {str(e)}")
+        decoded_payload = jwt.decode(raw_token, JWT_SECRET, algorithms=[JWT_ALGO])
+        gm_id = decoded_payload.get("sub")
+        if gm_id is None:
+            raise HTTPException(status_code=401, detail="Token payload missing GM ID.")
+    except Exception as jwt_err:
+        raise HTTPException(status_code=401, detail=f"Token verification failed: {str(jwt_err)}")
         
     try:
-        # Force convert back to integer for database safety
-        user = db.query(User).filter(User.id == int(user_id)).first()
-        if not user:
-            raise HTTPException(status_code=401, detail="User no longer in DB.")
-        return user
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"DB Error: {str(e)}")
-@app.post("/login")
-def login(req: AuthRequest, db: Session = Depends(get_db)):
-    try:
-        user = db.query(User).filter(User.username == req.username).first()
-        
-        if not user or not bcrypt.checkpw(req.password.encode('utf-8'), user.password_hash.encode('utf-8')):
-            raise HTTPException(status_code=401, detail="Incorrect username or password.")
-        
-        # Use simple unix timestamp (seconds) to prevent timezone bugs
-        expiration_timestamp = int(time.time()) + 86400  # Valid for exactly 24 hours
-        token = jwt.encode({"sub": str(user.id), "exp": expiration_timestamp}, SECRET_KEY, algorithm=ALGORITHM)
-        
-        return {"access_token": token, "username": user.username}
-    except HTTPException:
-        raise
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Login DB Error: {str(e)}")
+        # Cast to int for precise PostgreSQL querying
+        active_gm = db.query(GMFranchise).filter(GMFranchise.id == int(gm_id)).first()
+        if not active_gm:
+            raise HTTPException(status_code=401, detail="Franchise no longer exists in database.")
+        return active_gm
+    except Exception as db_err:
+        raise HTTPException(status_code=500, detail=f"Database query failed: {str(db_err)}")
 
-# --- FASTAPI SETUP ---
-app = FastAPI()
-client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
+# 5. FastAPI Application Initialization (Must be before routes!)
+app = FastAPI(title="Data Science Draft API")
+ai_scout_client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
 
 app.add_middleware(
     CORSMiddleware,
@@ -107,57 +105,64 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-class AuthRequest(BaseModel):
+# 6. Pydantic Schemas
+class FranchiseAuthPayload(BaseModel):
     username: str
     password: str
 
-class QuestionRequest(BaseModel):
+class DraftPickPayload(BaseModel):
     topic: str
     difficulty: str
 
+# 7. API Endpoints
 @app.post("/register")
-def register(req: AuthRequest, db: Session = Depends(get_db)):
+def register_franchise(req: FranchiseAuthPayload, db: Session = Depends(fetch_postgres_session)):
     try:
-        existing_user = db.query(User).filter(User.username == req.username).first()
-        if existing_user:
-            raise HTTPException(status_code=400, detail="Username already drafted.")
+        existing = db.query(GMFranchise).filter(GMFranchise.username == req.username).first()
+        if existing:
+            raise HTTPException(status_code=400, detail="Username already drafted by another GM.")
         
-        # USE BCRYPT DIRECTLY (Fixed Passlib Bug)
+        # Secure bcrypt hashing
         salt = bcrypt.gensalt()
-        hashed_pw = bcrypt.hashpw(req.password.encode('utf-8'), salt).decode('utf-8')
+        safe_hash = bcrypt.hashpw(req.password.encode('utf-8'), salt).decode('utf-8')
         
-        new_user = User(username=req.username, password_hash=hashed_pw)
-        db.add(new_user)
+        new_franchise = GMFranchise(username=req.username, password_hash=safe_hash)
+        db.add(new_franchise)
         db.commit()
-        return {"message": "Account created successfully!"}
+        return {"message": "Franchise created successfully!"}
     except HTTPException:
         raise
     except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Database Connection Error: {str(e)}")
+        raise HTTPException(status_code=500, detail=f"Registration DB Error: {str(e)}")
 
 @app.post("/login")
-def login(req: AuthRequest, db: Session = Depends(get_db)):
+def login_franchise(req: FranchiseAuthPayload, db: Session = Depends(fetch_postgres_session)):
     try:
-        user = db.query(User).filter(User.username == req.username).first()
+        gm = db.query(GMFranchise).filter(GMFranchise.username == req.username).first()
         
-        # USE BCRYPT DIRECTLY TO VERIFY
-        if not user or not bcrypt.checkpw(req.password.encode('utf-8'), user.password_hash.encode('utf-8')):
+        if not gm or not bcrypt.checkpw(req.password.encode('utf-8'), gm.password_hash.encode('utf-8')):
             raise HTTPException(status_code=401, detail="Incorrect username or password.")
         
-        token_expires = datetime.utcnow() + timedelta(hours=24)
-        token = jwt.encode({"sub": user.id, "exp": token_expires}, SECRET_KEY, algorithm=ALGORITHM)
-        return {"access_token": token, "username": user.username}
+        # Use basic unix timestamps to prevent any datetime timezone bugs
+        expiry_time = int(time.time()) + 86400  # 24 hour lifespan
+        access_token = jwt.encode({"sub": str(gm.id), "exp": expiry_time}, JWT_SECRET, algorithm=JWT_ALGO)
+        
+        return {"access_token": access_token, "username": gm.username}
     except HTTPException:
         raise
     except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Database Connection Error: {str(e)}")
+        raise HTTPException(status_code=500, detail=f"Login DB Error: {str(e)}")
 
 @app.post("/generate_question")
-def generate_question(req: QuestionRequest, db: Session = Depends(get_db), current_user: User = Depends(get_current_user)):
+def execute_draft_pick(
+    req: DraftPickPayload, 
+    db: Session = Depends(fetch_postgres_session), 
+    active_gm: GMFranchise = Depends(verify_front_office_token)
+):
     try:
-        past_logs = db.query(QuestionLog).filter(
-            QuestionLog.user_id == current_user.id,
-            QuestionLog.topic == req.topic
+        past_picks = db.query(ProspectScoutingLog).filter(
+            ProspectScoutingLog.user_id == active_gm.id,
+            ProspectScoutingLog.topic == req.topic
         ).all()
         
         system_prompt = (
@@ -167,37 +172,38 @@ def generate_question(req: QuestionRequest, db: Session = Depends(get_db), curre
         )
         
         user_prompt = f"Topic: {req.topic}\nTarget Difficulty Level: {req.difficulty}\n\n"
-        if past_logs:
+        if past_picks:
             user_prompt += "Do NOT ask any of these previously asked questions:\n"
-            for log in past_logs:
-                user_prompt += f"- {log.question_text[:100]}...\n"
+            for pick in past_picks:
+                user_prompt += f"- {pick.question_text[:100]}...\n"
             user_prompt += "\nGenerate a completely NEW question."
         else:
             user_prompt += "Generate a new question."
 
-        messages = [
+        ai_messages = [
             {"role": "system", "content": system_prompt},
             {"role": "user", "content": user_prompt}
         ]
         
-        response = client.chat.completions.create(
+        api_response = ai_scout_client.chat.completions.create(
             model="gpt-4o-mini",
-            messages=messages,
+            messages=ai_messages,
             max_tokens=150,
             temperature=0.7
         )
-        ai_question = response.choices[0].message.content
+        generated_q = api_response.choices[0].message.content
         
-        new_log = QuestionLog(
-            user_id=current_user.id,
+        # Log the question to prevent future duplicates
+        history_record = ProspectScoutingLog(
+            user_id=active_gm.id,
             topic=req.topic,
             difficulty=req.difficulty,
-            question_text=ai_question
+            question_text=generated_q
         )
-        db.add(new_log)
+        db.add(history_record)
         db.commit()
         
-        return {"question": ai_question}
+        return {"question": generated_q}
         
     except Exception as e:
-        return {"question": f"ERROR: {str(e)}"}
+        return {"question": f"SCOUTING SYSTEM ERROR: {str(e)}"}
