@@ -27,8 +27,12 @@ load_dotenv()
 
 # Render PostgreSQL Database URL adjustment
 RAW_DB_URL = os.getenv("DATABASE_URL", "sqlite:///./local_draft.db")
+
+# Force SQLAlchemy to explicitly use the psycopg2 driver
 if RAW_DB_URL.startswith("postgres://"):
-    CLEAN_DB_URL = RAW_DB_URL.replace("postgres://", "postgresql://", 1)
+    CLEAN_DB_URL = RAW_DB_URL.replace("postgres://", "postgresql+psycopg2://", 1)
+elif RAW_DB_URL.startswith("postgresql://"):
+    CLEAN_DB_URL = RAW_DB_URL.replace("postgresql://", "postgresql+psycopg2://", 1)
 else:
     CLEAN_DB_URL = RAW_DB_URL
 
