@@ -1,13 +1,14 @@
 """
 ======================================================================
-NFL DRAFT: DATA SCIENCE INTERVIEW PLATFORM - FIXED COMPLETE BACKEND
+NFL DRAFT: DATA SCIENCE INTERVIEW PLATFORM - COMPLETE BACKEND API
 ======================================================================
-FastAPI backend with PostgreSQL, bcrypt authentication, question history,
-and answer submission persistence.
+FastAPI backend with PostgreSQL, bcrypt authentication, question scouting,
+and AI-judged answer evaluation with 3-attempt progression.
 ======================================================================
 """
 import os
 import time
+import json
 import logging
 from datetime import datetime, timezone
 from typing import Generator, Optional
@@ -17,7 +18,7 @@ from dotenv import load_dotenv
 
 from fastapi import FastAPI, Depends, HTTPException, Request, status
 from fastapi.middleware.cors import CORSMiddleware
-from sqlalchemy import create_engine, Column, Integer, String, Text, DateTime
+from sqlalchemy import create_engine, Column, Integer, String, Text, Boolean, DateTime
 from sqlalchemy.orm import declarative_base, sessionmaker, Session
 from pydantic import BaseModel, Field
 from openai import OpenAI
@@ -27,7 +28,7 @@ load_dotenv()
 logging.basicConfig(level=logging.INFO)
 server_logger = logging.getLogger("InterviewBackend")
 
-# 2. Database Connection Configuration (Driver Bug Fixed)
+# 2. Database Connection Configuration
 RAW_DB_URL = os.getenv("DATABASE_URL", "sqlite:///./local_draft.db")
 
 # Force SQLAlchemy to use the installed psycopg2 driver
@@ -71,8 +72,8 @@ class ProspectScoutingLog(DraftBase):
 
 class CandidateAnswerSubmission(DraftBase):
     """
-    SQLAlchemy model storing candidate responses to technical questions.
-    Why: Maintains permanent audit logs of answers for review in DBeaver and admin dashboards.
+    SQLAlchemy model storing candidate responses and AI evaluation scores.
+    Why: Maintains permanent audit logs of answers and performance for review in DBeaver.
     """
     __tablename__ = "question_answers"
     id = Column(Integer, primary_key=True, index=True)
@@ -80,6 +81,10 @@ class CandidateAnswerSubmission(DraftBase):
     username = Column(String, nullable=True)
     question_text = Column(Text, nullable=False)
     answer_text = Column(Text, nullable=False)
+    attempt_number = Column(Integer, default=1)
+    is_correct = Column(Boolean, default=False)
+    feedback = Column(Text, nullable=True)
+    ideal_answer = Column(Text, nullable=True)
     created_at = Column(DateTime, default=lambda: datetime.now(timezone.utc))
 
 # Boot-time table creation
@@ -145,14 +150,15 @@ class DraftPickPayload(BaseModel):
     difficulty: Optional[str] = "Starter"
 
 class AnswerSubmissionPayload(BaseModel):
-    """Payload for submitting technical answers."""
+    """Payload for submitting technical answers with attempt count."""
     question: str = Field(..., min_length=3, description="The interview question text")
     answer: str = Field(..., min_length=1, description="The candidate's detailed answer")
+    attempt: Optional[int] = Field(default=1, ge=1, le=3, description="Current attempt number (1-3)")
     topic: Optional[str] = None
     difficulty: Optional[str] = None
 
 # 7. FastAPI App & Middleware
-app = FastAPI(title="Data Science Draft API - Fixed", version="2.5.0")
+app = FastAPI(title="Data Science Draft API - Evaluator", version="3.0.0")
 ai_scout_client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
 
 app.add_middleware(
@@ -163,14 +169,50 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# 8. API Endpoints
+# 8. AI Answer Evaluation Engine
+def evaluate_candidate_answer(question: str, candidate_answer: str) -> dict:
+    """
+    Evaluates candidate response using GPT-4o-mini structured JSON.
+    Why: Impartially judges correctness, delivers constructive feedback, and provides canonical answers.
+    """
+    try:
+        system_prompt = (
+            "You are an expert Data Science interviewer and judge. Evaluate the candidate's answer to the technical question. "
+            "You MUST return a valid JSON object with exactly three keys:\n"
+            "- \"is_correct\": boolean (true if candidate answer is conceptually sound, accurate, and covers the core concept; false if incorrect, superficial, or misleading)\n"
+            "- \"feedback\": string (1-2 sentences of coaching feedback explaining specifically what was accurate or what key concepts/assumptions were missing)\n"
+            "- \"ideal_answer\": string (a clear, canonical 2-3 sentence answer explaining the concept with industry best practices)"
+        )
+        user_prompt = f"Question:\n{question}\n\nCandidate Answer:\n{candidate_answer}"
+
+        response = ai_scout_client.chat.completions.create(
+            model="gpt-4o-mini",
+            response_format={"type": "json_object"},
+            messages=[
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": user_prompt}
+            ],
+            temperature=0.2
+        )
+        res_json = json.loads(response.choices[0].message.content)
+        return {
+            "is_correct": bool(res_json.get("is_correct", False)),
+            "feedback": str(res_json.get("feedback", "Evaluation complete.")),
+            "ideal_answer": str(res_json.get("ideal_answer", "Canonical answer unavailable."))
+        }
+    except Exception as exc:
+        server_logger.error("AI Evaluation error: %s", exc)
+        return {
+            "is_correct": False,
+            "feedback": "Evaluation system temporarily unavailable. Review core documentation.",
+            "ideal_answer": "Please review standard technical literature for this topic."
+        }
+
+# 9. API Endpoints
 
 @app.get("/health", status_code=status.HTTP_200_OK)
 def health_check(db: Session = Depends(fetch_postgres_session)):
-    """
-    Liveness probe verifying API and PostgreSQL responsiveness.
-    Why: Allows operators to monitor health and Render to verify web service availability.
-    """
+    """Liveness probe verifying API and PostgreSQL responsiveness."""
     try:
         db.execute(DraftBase.metadata.tables["users"].select().limit(1))
         return {"status": "healthy", "database": "connected"}
@@ -179,10 +221,7 @@ def health_check(db: Session = Depends(fetch_postgres_session)):
 
 @app.post("/register", status_code=status.HTTP_201_CREATED)
 def register_franchise(req: FranchiseAuthPayload, db: Session = Depends(fetch_postgres_session)):
-    """
-    Registers a new Front Office account with bcrypt password hashing.
-    Why: Secures user credentials and creates a persistent franchise record in PostgreSQL.
-    """
+    """Registers a new Front Office account with bcrypt password hashing."""
     try:
         existing = db.query(GMFranchise).filter(GMFranchise.username == req.username).first()
         if existing:
@@ -203,16 +242,13 @@ def register_franchise(req: FranchiseAuthPayload, db: Session = Depends(fetch_po
 
 @app.post("/login")
 def login_franchise(req: FranchiseAuthPayload, db: Session = Depends(fetch_postgres_session)):
-    """
-    Authenticates user credentials and generates a 24-hour JWT token.
-    Why: Grants authenticated access for question history tracking and answer logging.
-    """
+    """Authenticates user credentials and generates a 24-hour JWT token."""
     try:
         gm = db.query(GMFranchise).filter(GMFranchise.username == req.username).first()
         if not gm or not bcrypt.checkpw(req.password.encode("utf-8"), gm.password_hash.encode("utf-8")):
             raise HTTPException(status_code=401, detail="Incorrect username or password.")
 
-        expiry_time = int(time.time()) + 86400  # 24 hours
+        expiry_time = int(time.time()) + 86400
         access_token = jwt.encode({"sub": str(gm.id), "exp": expiry_time}, JWT_SECRET, algorithm=JWT_ALGO)
 
         return {"access_token": access_token, "username": gm.username, "user_id": gm.id}
@@ -221,7 +257,6 @@ def login_franchise(req: FranchiseAuthPayload, db: Session = Depends(fetch_postg
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Login DB Error: {str(e)}")
 
-# GET method: Fixes 405 error from React frontend
 @app.get("/generate_question")
 def generate_question_get(
     topic: str = "General Data Science",
@@ -229,23 +264,16 @@ def generate_question_get(
     db: Session = Depends(fetch_postgres_session),
     active_gm: Optional[GMFranchise] = Depends(get_optional_current_user)
 ):
-    """
-    Generates a question via GET.
-    Why: Prevents 405 Method Not Allowed error when called from React frontend.
-    """
+    """Generates a question via GET."""
     return execute_question_generation(topic, difficulty, db, active_gm)
 
-# POST method: Supports structured payloads
 @app.post("/generate_question")
 def generate_question_post(
     req: DraftPickPayload,
     db: Session = Depends(fetch_postgres_session),
     active_gm: Optional[GMFranchise] = Depends(get_optional_current_user)
 ):
-    """
-    Generates a question via POST.
-    Why: Supports JSON body payloads with topic and difficulty filters.
-    """
+    """Generates a question via POST."""
     return execute_question_generation(req.topic or "General Data Science", req.difficulty or "Starter", db, active_gm)
 
 def execute_question_generation(topic: str, difficulty: str, db: Session, active_gm: Optional[GMFranchise]):
@@ -286,7 +314,6 @@ def execute_question_generation(topic: str, difficulty: str, db: Session, active
         )
         generated_q = api_response.choices[0].message.content.strip()
 
-        # Log question in question_logs table
         history_record = ProspectScoutingLog(
             user_id=active_gm.id if active_gm else None,
             topic=topic,
@@ -308,7 +335,6 @@ def execute_question_generation(topic: str, difficulty: str, db: Session, active
         server_logger.error("Question generation failed: %s", e)
         return {"question": f"SCOUTING SYSTEM ERROR: {str(e)}", "question_id": None}
 
-# Saves candidate answer into PostgreSQL question_answers table
 @app.post("/submit_answer", status_code=status.HTTP_201_CREATED)
 def submit_candidate_answer(
     payload: AnswerSubmissionPayload,
@@ -316,8 +342,8 @@ def submit_candidate_answer(
     active_gm: Optional[GMFranchise] = Depends(get_optional_current_user)
 ):
     """
-    Saves candidate response into PostgreSQL question_answers table linked to user_id.
-    Why: Records evaluations permanently in PostgreSQL for auditing in DBeaver.
+    Evaluates candidate response via AI judge, applies 3-attempt scoring, and stores in PostgreSQL.
+    Why: Tells candidate if answer is correct, tracks attempts up to 3, and reveals ideal answer on completion.
     """
     trimmed_answer = payload.answer.strip()
     trimmed_question = payload.question.strip()
@@ -326,6 +352,17 @@ def submit_candidate_answer(
         raise HTTPException(status_code=400, detail="Answer cannot be blank.")
     if not trimmed_question:
         raise HTTPException(status_code=400, detail="Question cannot be blank.")
+
+    current_attempt = payload.attempt or 1
+
+    # 1. Evaluate with AI Judge
+    eval_result = evaluate_candidate_answer(trimmed_question, trimmed_answer)
+    is_correct = eval_result["is_correct"]
+    feedback = eval_result["feedback"]
+    ideal_answer = eval_result["ideal_answer"]
+
+    # Reveal canonical answer if correct OR on 3rd attempt
+    reveal_ideal = is_correct or current_attempt >= 3
 
     try:
         user_id = active_gm.id if active_gm else None
@@ -336,22 +373,28 @@ def submit_candidate_answer(
             username=username,
             question_text=trimmed_question,
             answer_text=trimmed_answer,
+            attempt_number=current_attempt,
+            is_correct=is_correct,
+            feedback=feedback,
+            ideal_answer=ideal_answer if reveal_ideal else None,
             created_at=datetime.now(timezone.utc)
         )
         db.add(submission)
         db.commit()
         db.refresh(submission)
 
-        server_logger.info("Answer persisted successfully. Submission ID: %s", submission.id)
+        server_logger.info("Answer evaluated. ID: %s, Correct: %s, Attempt: %s", submission.id, is_correct, current_attempt)
         return {
             "status": "success",
-            "message": "Answer saved to PostgreSQL successfully",
             "submission_id": submission.id,
-            "username": username,
-            "user_id": user_id,
+            "is_correct": is_correct,
+            "feedback": feedback,
+            "attempt": current_attempt,
+            "attempts_left": max(0, 3 - current_attempt),
+            "ideal_answer": ideal_answer if reveal_ideal else None,
             "created_at": submission.created_at.isoformat()
         }
     except Exception as db_err:
         db.rollback()
-        server_logger.error("Failed to commit answer submission: %s", db_err)
+        server_logger.error("Failed to commit evaluated answer: %s", db_err)
         raise HTTPException(status_code=500, detail=f"Database submission failed: {str(db_err)}")
