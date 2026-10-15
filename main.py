@@ -3,7 +3,8 @@
 NFL DRAFT: DATA SCIENCE INTERVIEW PLATFORM - COMPLETE BACKEND API
 ======================================================================
 FastAPI backend with PostgreSQL, bcrypt authentication, question scouting,
-and AI-judged answer evaluation with 3-attempt progression.
+and AI-judged answer evaluation with 3-attempt progression and self-healing
+schema migrations.
 ======================================================================
 """
 import os
@@ -18,7 +19,7 @@ from dotenv import load_dotenv
 
 from fastapi import FastAPI, Depends, HTTPException, Request, status
 from fastapi.middleware.cors import CORSMiddleware
-from sqlalchemy import create_engine, Column, Integer, String, Text, Boolean, DateTime
+from sqlalchemy import create_engine, text, Column, Integer, String, Text, Boolean, DateTime
 from sqlalchemy.orm import declarative_base, sessionmaker, Session
 from pydantic import BaseModel, Field
 from openai import OpenAI
@@ -87,12 +88,29 @@ class CandidateAnswerSubmission(DraftBase):
     ideal_answer = Column(Text, nullable=True)
     created_at = Column(DateTime, default=lambda: datetime.now(timezone.utc))
 
-# Boot-time table creation
+# Boot-time table creation & Self-Healing Column Migration
 try:
     DraftBase.metadata.create_all(bind=engine)
-    server_logger.info("All PostgreSQL tables (users, question_logs, question_answers) verified.")
+    server_logger.info("Base tables verified.")
+
+    # Automatically adds missing columns if question_answers was created earlier with fewer fields
+    with engine.connect() as conn:
+        for col_sql in [
+            "ALTER TABLE question_answers ADD COLUMN IF NOT EXISTS user_id INTEGER;",
+            "ALTER TABLE question_answers ADD COLUMN IF NOT EXISTS username VARCHAR;",
+            "ALTER TABLE question_answers ADD COLUMN IF NOT EXISTS attempt_number INTEGER DEFAULT 1;",
+            "ALTER TABLE question_answers ADD COLUMN IF NOT EXISTS is_correct BOOLEAN DEFAULT FALSE;",
+            "ALTER TABLE question_answers ADD COLUMN IF NOT EXISTS feedback TEXT;",
+            "ALTER TABLE question_answers ADD COLUMN IF NOT EXISTS ideal_answer TEXT;"
+        ]:
+            try:
+                conn.execute(text(col_sql))
+            except Exception:
+                pass
+        conn.commit()
+    server_logger.info("Self-healing auto-migration for question_answers completed.")
 except Exception as boot_err:
-    server_logger.error("Database schema boot failed: %s", boot_err)
+    server_logger.error("Database schema boot notice: %s", boot_err)
 
 # 4. Security Configuration
 JWT_SECRET = os.getenv("SECRET_KEY", "super_secret_draft_key_2026")
@@ -158,7 +176,7 @@ class AnswerSubmissionPayload(BaseModel):
     difficulty: Optional[str] = None
 
 # 7. FastAPI App & Middleware
-app = FastAPI(title="Data Science Draft API - Evaluator", version="3.0.0")
+app = FastAPI(title="Data Science Draft API - Evaluator", version="3.1.0")
 ai_scout_client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
 
 app.add_middleware(
