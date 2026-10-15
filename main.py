@@ -59,7 +59,7 @@ class GMFranchise(DraftBase):
 class ProspectScoutingLog(DraftBase):
     """
     SQLAlchemy model tracking generated questions per user.
-    Why: Prevents duplicate questions by comparing against user historical prompts.
+    Why: Matches existing PostgreSQL table schema exactly to avoid UndefinedColumn errors.
     """
     __tablename__ = "question_logs"
     id = Column(Integer, primary_key=True, index=True)
@@ -67,7 +67,6 @@ class ProspectScoutingLog(DraftBase):
     topic = Column(String, nullable=True)
     difficulty = Column(String, nullable=True)
     question_text = Column(Text, nullable=False)
-    answer_text = Column(Text, nullable=True)
     created_at = Column(DateTime, default=lambda: datetime.now(timezone.utc))
 
 class CandidateAnswerSubmission(DraftBase):
@@ -309,7 +308,7 @@ def execute_question_generation(topic: str, difficulty: str, db: Session, active
         server_logger.error("Question generation failed: %s", e)
         return {"question": f"SCOUTING SYSTEM ERROR: {str(e)}", "question_id": None}
 
-# NEW: Saves candidate answer into PostgreSQL database
+# Saves candidate answer into PostgreSQL question_answers table
 @app.post("/submit_answer", status_code=status.HTTP_201_CREATED)
 def submit_candidate_answer(
     payload: AnswerSubmissionPayload,
@@ -340,15 +339,6 @@ def submit_candidate_answer(
             created_at=datetime.now(timezone.utc)
         )
         db.add(submission)
-
-        if user_id:
-            matching_log = db.query(ProspectScoutingLog).filter(
-                ProspectScoutingLog.user_id == user_id,
-                ProspectScoutingLog.question_text == trimmed_question
-            ).first()
-            if matching_log:
-                matching_log.answer_text = trimmed_answer
-
         db.commit()
         db.refresh(submission)
 
