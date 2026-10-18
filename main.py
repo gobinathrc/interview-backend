@@ -4,6 +4,7 @@ NFL DRAFT: DATA SCIENCE INTERVIEW PLATFORM - COMPLETE BACKEND API
 ======================================================================
 FastAPI backend with PostgreSQL, bcrypt authentication, question scouting,
 AI-judged answer evaluation with 3-attempt progression, 0-100 scoring,
+guest session tracking, personalization (Strengths & Weaknesses analytics),
 and self-healing schema migrations.
 ======================================================================
 """
@@ -12,12 +13,12 @@ import time
 import json
 import logging
 from datetime import datetime, timezone
-from typing import Generator, Optional
+from typing import Generator, Optional, Dict, Any, List
 import bcrypt
 import jwt
 from dotenv import load_dotenv
 
-from fastapi import FastAPI, Depends, HTTPException, Request, status
+from fastapi import FastAPI, Depends, HTTPException, Request, Header, status
 from fastapi.middleware.cors import CORSMiddleware
 from sqlalchemy import create_engine, text, Column, Integer, String, Text, Boolean, DateTime
 from sqlalchemy.orm import declarative_base, sessionmaker, Session
@@ -32,6 +33,7 @@ server_logger = logging.getLogger("InterviewBackend")
 # 2. Database Connection Configuration
 RAW_DB_URL = os.getenv("DATABASE_URL", "sqlite:///./local_draft.db")
 
+# Force SQLAlchemy to use the installed psycopg2 driver on Render
 if RAW_DB_URL.startswith("postgres://"):
     CLEAN_DB_URL = RAW_DB_URL.replace("postgres://", "postgresql+psycopg2://", 1)
 elif RAW_DB_URL.startswith("postgresql://"):
@@ -41,6 +43,7 @@ else:
 
 connect_args = {"check_same_thread": False} if CLEAN_DB_URL.startswith("sqlite") else {}
 
+# pool_pre_ping=True prevents drops from idle cloud PostgreSQL connections
 engine = create_engine(CLEAN_DB_URL, pool_pre_ping=True, connect_args=connect_args)
 DraftSessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
 DraftBase = declarative_base()
@@ -58,12 +61,13 @@ class GMFranchise(DraftBase):
 
 class ProspectScoutingLog(DraftBase):
     """
-    SQLAlchemy model tracking generated questions per user.
-    Why: Matches existing PostgreSQL table schema exactly to avoid UndefinedColumn errors.
+    SQLAlchemy model tracking generated questions per user and guest.
+    Why: Matches existing PostgreSQL table schema and enables guest tracking.
     """
     __tablename__ = "question_logs"
     id = Column(Integer, primary_key=True, index=True)
     user_id = Column(Integer, index=True, nullable=True)
+    guest_id = Column(String, index=True, nullable=True)
     topic = Column(String, nullable=True)
     difficulty = Column(String, nullable=True)
     question_text = Column(Text, nullable=False)
@@ -71,13 +75,16 @@ class ProspectScoutingLog(DraftBase):
 
 class CandidateAnswerSubmission(DraftBase):
     """
-    SQLAlchemy model storing candidate responses, AI evaluation scores, and 0-100 scoring.
+    SQLAlchemy model storing candidate responses, scores, topics, and personalization telemetry.
     Why: Maintains permanent audit logs of answers and performance for review in DBeaver.
     """
     __tablename__ = "question_answers"
     id = Column(Integer, primary_key=True, index=True)
     user_id = Column(Integer, index=True, nullable=True)
+    guest_id = Column(String, index=True, nullable=True)
     username = Column(String, nullable=True)
+    topic = Column(String, nullable=True)
+    difficulty = Column(String, nullable=True)
     question_text = Column(Text, nullable=False)
     answer_text = Column(Text, nullable=False)
     attempt_number = Column(Integer, default=1)
@@ -92,23 +99,28 @@ try:
     DraftBase.metadata.create_all(bind=engine)
     server_logger.info("Base tables verified.")
 
-    # Automatically adds missing columns if question_answers was created earlier with fewer fields
+    # Automatically adds missing columns if tables were created earlier with fewer fields
     with engine.connect() as conn:
-        for col_sql in [
+        migration_statements = [
+            "ALTER TABLE question_logs ADD COLUMN IF NOT EXISTS guest_id VARCHAR;",
             "ALTER TABLE question_answers ADD COLUMN IF NOT EXISTS user_id INTEGER;",
+            "ALTER TABLE question_answers ADD COLUMN IF NOT EXISTS guest_id VARCHAR;",
             "ALTER TABLE question_answers ADD COLUMN IF NOT EXISTS username VARCHAR;",
+            "ALTER TABLE question_answers ADD COLUMN IF NOT EXISTS topic VARCHAR;",
+            "ALTER TABLE question_answers ADD COLUMN IF NOT EXISTS difficulty VARCHAR;",
             "ALTER TABLE question_answers ADD COLUMN IF NOT EXISTS attempt_number INTEGER DEFAULT 1;",
             "ALTER TABLE question_answers ADD COLUMN IF NOT EXISTS is_correct BOOLEAN DEFAULT FALSE;",
             "ALTER TABLE question_answers ADD COLUMN IF NOT EXISTS score INTEGER DEFAULT 0;",
             "ALTER TABLE question_answers ADD COLUMN IF NOT EXISTS feedback TEXT;",
             "ALTER TABLE question_answers ADD COLUMN IF NOT EXISTS ideal_answer TEXT;"
-        ]:
+        ]
+        for col_sql in migration_statements:
             try:
                 conn.execute(text(col_sql))
             except Exception:
                 pass
         conn.commit()
-    server_logger.info("Self-healing auto-migration for question_answers completed.")
+    server_logger.info("Self-healing auto-migration completed.")
 except Exception as boot_err:
     server_logger.error("Database schema boot notice: %s", boot_err)
 
@@ -119,297 +131,440 @@ JWT_ALGO = "HS256"
 # 5. Dependency Injection
 def fetch_postgres_session() -> Generator[Session, None, None]:
     """
-    Provides isolated database transaction sessions.
-    Why: Ensures session closure and pool reclamation on every request.
+    Yields an active database session and guarantees closure upon request completion.
+    Why: Prevents PostgreSQL connection pool exhaustion by strictly bounding session lifecycles.
     """
-    db_session = DraftSessionLocal()
+    db = DraftSessionLocal()
     try:
-        yield db_session
+        yield db
     finally:
-        db_session.close()
+        db.close()
 
-def verify_front_office_token(
-    request: Request,
-    db: Session = Depends(fetch_postgres_session)
-) -> GMFranchise:
+def get_optional_current_user(request: Request, db: Session = Depends(fetch_postgres_session)) -> Optional[GMFranchise]:
     """
-    Validates Bearer token headers and loads the requesting GM record.
-    Why: Guards routes against unauthenticated requests.
+    Extracts the authenticated user from the Authorization Bearer header if provided.
+    Why: Allows seamless support for both logged-in GMs and guest users without throwing 401.
     """
     auth_header = request.headers.get("Authorization")
     if not auth_header or not auth_header.startswith("Bearer "):
-        raise HTTPException(
-            status_code=status.HTTP_401_UNAUTHORIZED,
-            detail="Missing or malformed Authorization header."
-        )
-
+        return None
     raw_token = auth_header.split(" ")[1]
     try:
         decoded_payload = jwt.decode(raw_token, JWT_SECRET, algorithms=[JWT_ALGO])
         gm_id = decoded_payload.get("sub")
-        if gm_id is None:
-            raise HTTPException(
-                status_code=status.HTTP_401_UNAUTHORIZED,
-                detail="Token payload is missing subject ID."
-            )
+        if gm_id is not None:
+            return db.query(GMFranchise).filter(GMFranchise.id == int(gm_id)).first()
     except Exception as jwt_err:
-        raise HTTPException(
-            status_code=status.HTTP_401_UNAUTHORIZED,
-            detail=f"Token verification failed: {str(jwt_err)}"
-        )
+        server_logger.warning("Token decode notice: %s", jwt_err)
+    return None
 
-    try:
-        gm_id_int = int(gm_id)
-        current_gm = db.query(GMFranchise).filter(GMFranchise.id == gm_id_int).first()
-    except (ValueError, TypeError):
-        current_gm = db.query(GMFranchise).filter(GMFranchise.username == str(gm_id)).first()
-
-    if not current_gm:
-        raise HTTPException(
-            status_code=status.HTTP_401_UNAUTHORIZED,
-            detail="Franchise account no longer exists."
-        )
-
-    return current_gm
-
-# 6. Request/Response Schemas
-class FrontOfficeCredentials(BaseModel):
-    username: str
-    password: str
-
-class QuestionDraftRequest(BaseModel):
-    topic: str
-    difficulty: str
-
-class AnswerSubmissionRequest(BaseModel):
-    question: str = Field(..., min_length=5)
-    answer: str = Field(..., min_length=1)
-    attempt: int = Field(1, ge=1, le=3)
-
-# 7. AI Evaluation Engine
-def evaluate_candidate_answer(
-    question: str,
-    answer: str,
-    attempt: int
-) -> dict:
+def verify_front_office_token(request: Request, db: Session = Depends(fetch_postgres_session)) -> GMFranchise:
     """
-    Evaluates a candidate's answer with an integer score (0-100) and actionable feedback.
-    Why: Gives a numeric competency score alongside coaching advice and answers.
+    Strict authentication gate for protected endpoints.
+    Why: Restricts sensitive actions to authenticated users with valid JWT tokens.
     """
-    client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
+    user = get_optional_current_user(request, db)
+    if not user:
+        raise HTTPException(status_code=401, detail="Authentication required. Please log in.")
+    return user
 
-    eval_prompt = f"""
-You are the Head Coach and General Manager at the NFL Data Science Combine.
-Grade the candidate's answer to this technical interview question.
+# 6. Pydantic Schemas
+class FranchiseAuthPayload(BaseModel):
+    """Payload for user registration and authentication."""
+    username: str = Field(..., min_length=3, description="Unique GM username")
+    password: str = Field(..., min_length=4, description="Raw account password")
 
-Question: {question}
-Candidate's Answer: {answer}
-Current Attempt: {attempt} of 3
+class DraftPickPayload(BaseModel):
+    """Payload for generating questions with optional filters."""
+    topic: Optional[str] = "General Data Science"
+    difficulty: Optional[str] = "Starter"
 
-Provide:
-1. "score": An integer from 0 to 100 reflecting accuracy, depth, and clarity:
-   - 90-100: Elite / First-Round Lock (Complete, highly precise, covers edge cases)
-   - 70-89: Starter Grade (Correct core concepts, minor nuances omitted)
-   - 50-69: Practice Squad (Partial credit, understands basic premise but missing key steps)
-   - 25-49: Training Camp (Weak or superficial, significant gaps)
-   - 0-24: Cut Day (Completely incorrect, irrelevant, or hallucinated)
-2. "is_correct": boolean (true if score >= 70, false otherwise).
-3. "feedback": 2-3 sentences of coaching feedback:
-   - If score >= 70: Commend the candidate on specifics they got right.
-   - If score < 70 and attempt < 3: Point out what is missing without revealing the full answer.
-   - If attempt == 3: Explain what was missing directly.
-4. "ideal_answer": A concise 2-4 sentence model solution.
+class AnswerSubmissionPayload(BaseModel):
+    """Payload for submitting technical answers with attempt count, topic, and difficulty."""
+    question: str = Field(..., min_length=3, description="The interview question text")
+    answer: str = Field(..., min_length=1, description="The candidate's detailed answer")
+    attempt: Optional[int] = Field(default=1, ge=1, le=3, description="Current attempt number (1-3)")
+    topic: Optional[str] = "General Data Science"
+    difficulty: Optional[str] = "Starter"
 
-Respond STRICTLY in valid JSON with no markdown wrapping:
-{{"score": 85, "is_correct": true, "feedback": "...", "ideal_answer": "..."}}
-"""
-
-    try:
-        response = client.chat.completions.create(
-            model="gpt-4o",
-            messages=[{"role": "user", "content": eval_prompt}],
-            temperature=0.2,
-            response_format={"type": "json_object"}
-        )
-        parsed = json.loads(response.choices[0].message.content)
-        score = int(parsed.get("score", 0))
-        score = max(0, min(100, score))
-        is_correct = bool(parsed.get("is_correct", score >= 70))
-        return {
-            "score": score,
-            "is_correct": is_correct,
-            "feedback": parsed.get("feedback", "Evaluation completed."),
-            "ideal_answer": parsed.get("ideal_answer", "N/A")
-        }
-    except Exception as err:
-        server_logger.warning("OpenAI evaluation fallback: %s", err)
-        return {
-            "score": 0,
-            "is_correct": False,
-            "feedback": "Evaluation completed. Please verify your technical keywords and retry.",
-            "ideal_answer": "Standard industry practice requires detailed trade-off analysis and algorithmic justification."
-        }
-
-# 8. FastAPI Application Setup
+# 7. FastAPI App & Middleware
 app = FastAPI(
-    title="NFL Draft: Data Science Combine API",
-    description="Backend API with PostgreSQL persistence, 0-100 scoring, and 3-attempt AI evaluation.",
-    version="3.0.0"
+    title="Data Science Draft API - Evaluator & Personalization Engine",
+    description="Backend API with PostgreSQL persistence, 0-100 scoring, guest sessions, and personal strengths/weaknesses profiling.",
+    version="5.0.0"
 )
+ai_scout_client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
 
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
-    allow_credentials=True,
+    allow_credentials=False,
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
+# 8. AI Answer Evaluation Engine (with 0-100 Score)
+def evaluate_candidate_answer(question: str, candidate_answer: str) -> dict:
+    """
+    Evaluates candidate response using GPT-4o-mini structured JSON with a 0-100 score.
+    Why: Provides granular performance grading beyond binary correct/incorrect so candidates
+         understand partial credit and where they stand on the depth of their knowledge.
+    """
+    try:
+        system_prompt = (
+            "You are an expert Data Science interviewer and impartial judge. "
+            "Evaluate the candidate's answer to the technical question.\n\n"
+            "You MUST return a valid JSON object with exactly four keys:\n"
+            "- \"score\": integer between 0 and 100 representing the quality of the answer. "
+            "Use these bands strictly: "
+            "90-100 = comprehensive and precise with edge-case awareness; "
+            "70-89 = correct fundamentals with minor gaps; "
+            "50-69 = partially correct, core concept present but incomplete; "
+            "25-49 = incorrect but shows some domain awareness; "
+            "0-24 = off-topic or fundamentally wrong.\n"
+            "- \"is_correct\": boolean — true only if score >= 70.\n"
+            "- \"feedback\": string — 2-3 sentences of specific coaching feedback explaining "
+            "what was accurate and what key concept or precision was missing.\n"
+            "- \"ideal_answer\": string — a clear, canonical 2-4 sentence model answer using industry best practices."
+        )
+        user_prompt = f"Question:\n{question}\n\nCandidate Answer:\n{candidate_answer}"
+
+        response = ai_scout_client.chat.completions.create(
+            model="gpt-4o-mini",
+            response_format={"type": "json_object"},
+            messages=[
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": user_prompt}
+            ],
+            temperature=0.2
+        )
+        res_json = json.loads(response.choices[0].message.content)
+
+        raw_score = res_json.get("score", 0)
+        clamped_score = max(0, min(100, int(raw_score)))
+
+        return {
+            "score": clamped_score,
+            "is_correct": bool(res_json.get("is_correct", clamped_score >= 70)),
+            "feedback": str(res_json.get("feedback", "Evaluation complete.")),
+            "ideal_answer": str(res_json.get("ideal_answer", "Canonical answer unavailable."))
+        }
+    except Exception as exc:
+        server_logger.error("AI Evaluation error: %s", exc)
+        return {
+            "score": 0,
+            "is_correct": False,
+            "feedback": "Evaluation system temporarily unavailable. Review core documentation.",
+            "ideal_answer": "Please review standard technical literature for this topic."
+        }
+
 # 9. API Endpoints
-@app.get("/")
-def health_check():
-    """Returns service health status."""
-    return {"status": "active", "service": "NFL Draft Data Science API", "engine": "PostgreSQL"}
 
-@app.post("/register")
-def register_franchise(credentials: FrontOfficeCredentials, db: Session = Depends(fetch_postgres_session)):
-    """Registers a new user franchise account."""
-    existing_user = db.query(GMFranchise).filter(GMFranchise.username == credentials.username).first()
-    if existing_user:
-        raise HTTPException(status_code=400, detail="Franchise username already claimed.")
+@app.get("/health", status_code=status.HTTP_200_OK)
+def health_check(db: Session = Depends(fetch_postgres_session)):
+    """Liveness probe verifying API and PostgreSQL responsiveness."""
+    try:
+        db.execute(text("SELECT 1"))
+        return {"status": "healthy", "database": "connected"}
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=f"Database connectivity failed: {str(exc)}")
 
-    salt = bcrypt.gensalt()
-    hashed_pwd = bcrypt.hashpw(credentials.password.encode("utf-8"), salt).decode("utf-8")
+@app.post("/register", status_code=status.HTTP_201_CREATED)
+def register_franchise(req: FranchiseAuthPayload, db: Session = Depends(fetch_postgres_session)):
+    """Registers a new Front Office account with bcrypt password hashing."""
+    try:
+        existing = db.query(GMFranchise).filter(GMFranchise.username == req.username).first()
+        if existing:
+            raise HTTPException(status_code=400, detail="Username already drafted by another GM.")
 
-    new_gm = GMFranchise(username=credentials.username, password_hash=hashed_pwd)
-    db.add(new_gm)
-    db.commit()
-    db.refresh(new_gm)
+        salt = bcrypt.gensalt()
+        safe_hash = bcrypt.hashpw(req.password.encode("utf-8"), salt).decode("utf-8")
 
-    return {"status": "success", "message": f"Franchise '{new_gm.username}' established."}
+        new_franchise = GMFranchise(username=req.username, password_hash=safe_hash)
+        db.add(new_franchise)
+        db.commit()
+        return {"message": "Franchise created successfully!"}
+    except HTTPException:
+        raise
+    except Exception as e:
+        db.rollback()
+        raise HTTPException(status_code=500, detail=f"Registration DB Error: {str(e)}")
 
 @app.post("/login")
-def login_franchise(credentials: FrontOfficeCredentials, db: Session = Depends(fetch_postgres_session)):
-    """Authenticates credentials and issues a JWT token."""
-    user = db.query(GMFranchise).filter(GMFranchise.username == credentials.username).first()
-    if not user:
-        raise HTTPException(status_code=401, detail="Invalid franchise username or password.")
+def login_franchise(req: FranchiseAuthPayload, db: Session = Depends(fetch_postgres_session)):
+    """Authenticates user credentials and generates a 24-hour JWT token."""
+    try:
+        gm = db.query(GMFranchise).filter(GMFranchise.username == req.username).first()
+        if not gm or not bcrypt.checkpw(req.password.encode("utf-8"), gm.password_hash.encode("utf-8")):
+            raise HTTPException(status_code=401, detail="Incorrect username or password.")
 
-    is_valid = bcrypt.checkpw(credentials.password.encode("utf-8"), user.password_hash.encode("utf-8"))
-    if not is_valid:
-        raise HTTPException(status_code=401, detail="Invalid franchise username or password.")
+        expiry_time = int(time.time()) + 86400
+        access_token = jwt.encode({"sub": str(gm.id), "exp": expiry_time}, JWT_SECRET, algorithm=JWT_ALGO)
 
-    token_payload = {
-        "sub": str(user.id),
-        "username": user.username,
-        "exp": int(time.time()) + (24 * 3600)
-    }
-    encoded_token = jwt.encode(token_payload, JWT_SECRET, algorithm=JWT_ALGO)
+        return {"access_token": access_token, "username": gm.username, "user_id": gm.id}
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Login DB Error: {str(e)}")
 
-    return {
-        "access_token": encoded_token,
-        "token_type": "bearer",
-        "username": user.username
-    }
-
-@app.post("/draft_question")
-def draft_question(
-    draft_request: QuestionDraftRequest,
-    current_gm: GMFranchise = Depends(verify_front_office_token),
-    db: Session = Depends(fetch_postgres_session)
+# MATCHES FRONTEND URL: /generate_question (Supports both GET and POST)
+@app.get("/generate_question")
+def generate_question_get(
+    topic: str = "General Data Science",
+    difficulty: str = "Starter",
+    x_guest_id: Optional[str] = Header(None),
+    db: Session = Depends(fetch_postgres_session),
+    active_gm: Optional[GMFranchise] = Depends(get_optional_current_user)
 ):
-    """Generates an interview question avoiding duplicates for the current user."""
-    prior_logs = db.query(ProspectScoutingLog).filter(
-        ProspectScoutingLog.user_id == current_gm.id,
-        ProspectScoutingLog.topic == draft_request.topic
-    ).all()
-    past_questions = [log.question_text for log in prior_logs]
+    """Generates a question via GET."""
+    return execute_question_generation(topic, difficulty, db, active_gm, x_guest_id)
 
-    history_context = ""
-    if past_questions:
-        history_context = "DO NOT repeat or closely rephrase any of these questions:\n"
-        for i, q in enumerate(past_questions[-10:], 1):
-            history_context += f"{i}. {q}\n"
+@app.post("/generate_question")
+def generate_question_post(
+    req: DraftPickPayload,
+    x_guest_id: Optional[str] = Header(None),
+    db: Session = Depends(fetch_postgres_session),
+    active_gm: Optional[GMFranchise] = Depends(get_optional_current_user)
+):
+    """Generates a question via POST."""
+    return execute_question_generation(req.topic or "General Data Science", req.difficulty or "Starter", db, active_gm, x_guest_id)
 
-    prompt = f"""
-You are the Head Scout for an NFL Data Science Front Office.
-Generate a high-yield {draft_request.difficulty} interview question on: {draft_request.topic}.
-Keep it realistic to real-world machine learning, data engineering, or statistics.
-Only output the question text.
+def execute_question_generation(
+    topic: str,
+    difficulty: str,
+    db: Session,
+    active_gm: Optional[GMFranchise],
+    guest_id: Optional[str] = None
+):
+    """Internal helper to generate questions with OpenAI and log to PostgreSQL for user or guest."""
+    try:
+        past_picks = []
+        if active_gm:
+            past_picks = db.query(ProspectScoutingLog).filter(
+                ProspectScoutingLog.user_id == active_gm.id,
+                ProspectScoutingLog.topic == topic
+            ).all()
+        elif guest_id:
+            past_picks = db.query(ProspectScoutingLog).filter(
+                ProspectScoutingLog.guest_id == guest_id,
+                ProspectScoutingLog.topic == topic
+            ).all()
 
-{history_context}
-"""
+        system_prompt = (
+            "You are an expert Data Science interviewer with 60 years of combined industry and academic experience. "
+            "You ask innovative, highly challenging technical interview questions. "
+            "Do NOT include introductions, preambles, or conversational greetings. Output ONLY the exact interview question."
+        )
 
-    client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
-    response = client.chat.completions.create(
-        model="gpt-4o",
-        messages=[{"role": "user", "content": prompt}],
-        temperature=0.7
-    )
-    question_text = response.choices[0].message.content.strip()
+        user_prompt = f"Topic: {topic}\nTarget Difficulty Level: {difficulty}\n\n"
+        if past_picks:
+            user_prompt += "Do NOT repeat any of these previously asked questions:\n"
+            for pick in past_picks[-5:]:
+                user_prompt += f"- {pick.question_text[:120]}...\n"
+            user_prompt += "\nGenerate a completely NEW and creative question."
+        else:
+            user_prompt += "Generate a new challenging interview question."
 
-    log_entry = ProspectScoutingLog(
-        user_id=current_gm.id,
-        topic=draft_request.topic,
-        difficulty=draft_request.difficulty,
-        question_text=question_text
-    )
-    db.add(log_entry)
-    db.commit()
+        api_response = ai_scout_client.chat.completions.create(
+            model="gpt-4o-mini",
+            messages=[
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": user_prompt}
+            ],
+            max_tokens=200,
+            temperature=0.7
+        )
+        generated_q = api_response.choices[0].message.content.strip()
 
-    return {"question": question_text}
+        history_record = ProspectScoutingLog(
+            user_id=active_gm.id if active_gm else None,
+            guest_id=guest_id if not active_gm else None,
+            topic=topic,
+            difficulty=difficulty,
+            question_text=generated_q,
+            created_at=datetime.now(timezone.utc)
+        )
+        db.add(history_record)
+        db.commit()
+        db.refresh(history_record)
 
-@app.post("/submit_answer")
-def submit_answer(
-    submission: AnswerSubmissionRequest,
-    current_gm: GMFranchise = Depends(verify_front_office_token),
-    db: Session = Depends(fetch_postgres_session)
+        return {
+            "question": generated_q,
+            "question_id": history_record.id,
+            "topic": topic,
+            "difficulty": difficulty
+        }
+    except Exception as e:
+        server_logger.error("Question generation failed: %s", e)
+        return {"question": f"SCOUTING SYSTEM ERROR: {str(e)}", "question_id": None}
+
+# MATCHES FRONTEND URL: /submit_answer
+@app.post("/submit_answer", status_code=status.HTTP_201_CREATED)
+def submit_candidate_answer(
+    payload: AnswerSubmissionPayload,
+    x_guest_id: Optional[str] = Header(None),
+    db: Session = Depends(fetch_postgres_session),
+    active_gm: Optional[GMFranchise] = Depends(get_optional_current_user)
 ):
     """
-    Evaluates candidate responses, assigns 0-100 scores, and tracks 3 attempts.
+    Evaluates answer via AI judge, applies 0-100 scoring, 3-attempt progression,
+    and stores candidate answers in PostgreSQL for both logged-in users and guests.
     """
-    attempt = submission.attempt
-    eval_result = evaluate_candidate_answer(
-        question=submission.question,
-        answer=submission.answer,
-        attempt=attempt
-    )
+    trimmed_answer = payload.answer.strip()
+    trimmed_question = payload.question.strip()
 
-    is_correct = eval_result["is_correct"]
+    if not trimmed_answer:
+        raise HTTPException(status_code=400, detail="Answer cannot be blank.")
+    if not trimmed_question:
+        raise HTTPException(status_code=400, detail="Question cannot be blank.")
+
+    current_attempt = payload.attempt or 1
+
+    # 1. Evaluate with AI Judge (returns score + is_correct + feedback + ideal_answer)
+    eval_result = evaluate_candidate_answer(trimmed_question, trimmed_answer)
     score = eval_result["score"]
+    is_correct = eval_result["is_correct"]
     feedback = eval_result["feedback"]
     ideal_answer = eval_result["ideal_answer"]
-    attempts_left = max(0, 3 - attempt)
 
-    # Persist the submission into question_answers table
+    # Reveal ideal answer only when correct OR final attempt exhausted
+    reveal_ideal = is_correct or current_attempt >= 3
+
     try:
-        audit_record = CandidateAnswerSubmission(
-            user_id=current_gm.id,
-            username=current_gm.username,
-            question_text=submission.question,
-            answer_text=submission.answer,
-            attempt_number=attempt,
+        user_id = active_gm.id if active_gm else None
+        guest_id = x_guest_id if not active_gm else None
+        username = active_gm.username if active_gm else (f"Guest_{x_guest_id[:6]}" if x_guest_id else "Guest")
+
+        submission = CandidateAnswerSubmission(
+            user_id=user_id,
+            guest_id=guest_id,
+            username=username,
+            topic=payload.topic or "General Data Science",
+            difficulty=payload.difficulty or "Starter",
+            question_text=trimmed_question,
+            answer_text=trimmed_answer,
+            attempt_number=current_attempt,
             is_correct=is_correct,
             score=score,
             feedback=feedback,
-            ideal_answer=ideal_answer
+            ideal_answer=ideal_answer if reveal_ideal else None,
+            created_at=datetime.now(timezone.utc)
         )
-        db.add(audit_record)
+        db.add(submission)
         db.commit()
-    except Exception as persist_err:
-        server_logger.error("Failed to persist answer submission: %s", persist_err)
-        db.rollback()
+        db.refresh(submission)
 
-    # Mask ideal answer on attempts 1-2 unless candidate passed (score >= 70)
-    visible_ideal_answer = ideal_answer if (is_correct or attempt >= 3) else None
+        server_logger.info(
+            "Answer evaluated. ID: %s | Score: %s/100 | Correct: %s | User: %s | Guest: %s",
+            submission.id, score, is_correct, username, guest_id
+        )
+        return {
+            "status": "success",
+            "submission_id": submission.id,
+            "score": score,
+            "is_correct": is_correct,
+            "feedback": feedback,
+            "attempt": current_attempt,
+            "attempts_left": max(0, 3 - current_attempt),
+            "ideal_answer": ideal_answer if reveal_ideal else None,
+            "created_at": submission.created_at.isoformat()
+        }
+    except Exception as db_err:
+        db.rollback()
+        server_logger.error("Failed to commit evaluated answer: %s", db_err)
+        raise HTTPException(status_code=500, detail=f"Database submission failed: {str(db_err)}")
+
+# PERSONALIZATION: STRENGTHS & WEAKNESSES SCOUTING REPORT
+@app.get("/analytics/scouting_report")
+def get_scouting_report(
+    x_guest_id: Optional[str] = Header(None),
+    db: Session = Depends(fetch_postgres_session),
+    active_gm: Optional[GMFranchise] = Depends(get_optional_current_user)
+):
+    """
+    Computes personalized candidate analytics, highlighting Strengths, Weaknesses,
+    topic mastery percentages, and tailored coaching recommendations.
+    """
+    query = db.query(CandidateAnswerSubmission)
+    if active_gm:
+        query = query.filter(CandidateAnswerSubmission.user_id == active_gm.id)
+    elif x_guest_id:
+        query = query.filter(CandidateAnswerSubmission.guest_id == x_guest_id)
+    else:
+        return {
+            "total_answers": 0,
+            "overall_avg_score": 0,
+            "strengths": [],
+            "weaknesses": [],
+            "topic_breakdown": {},
+            "recommendation": "Start drafting questions to unlock your personalized scouting report!"
+        }
+
+    answers = query.order_by(CandidateAnswerSubmission.created_at.desc()).all()
+
+    if not answers:
+        return {
+            "total_answers": 0,
+            "overall_avg_score": 0,
+            "strengths": [],
+            "weaknesses": [],
+            "topic_breakdown": {},
+            "recommendation": "No combine data recorded yet. Pick a drill from the Draft Board to begin!"
+        }
+
+    topic_stats: Dict[str, Dict[str, Any]] = {}
+    total_score = 0
+
+    for a in answers:
+        t = a.topic or "General Data Science"
+        if t not in topic_stats:
+            topic_stats[t] = {"total_score": 0, "count": 0, "correct_count": 0, "highest_score": 0}
+        sc = a.score or 0
+        topic_stats[t]["total_score"] += sc
+        topic_stats[t]["count"] += 1
+        if a.is_correct:
+            topic_stats[t]["correct_count"] += 1
+        if sc > topic_stats[t]["highest_score"]:
+            topic_stats[t]["highest_score"] = sc
+        total_score += sc
+
+    strengths = []
+    weaknesses = []
+    breakdown = {}
+
+    for t, stat in topic_stats.items():
+        avg = round(stat["total_score"] / stat["count"], 1)
+        pass_rate = round((stat["correct_count"] / stat["count"]) * 100, 1)
+        breakdown[t] = {
+            "avg_score": avg,
+            "attempts": stat["count"],
+            "pass_rate": pass_rate,
+            "highest_score": stat["highest_score"]
+        }
+        if avg >= 70:
+            tier = "🏆 Elite Lock" if avg >= 90 else "🏈 Starter Grade"
+            strengths.append({"topic": t, "avg_score": avg, "grade": tier, "attempts": stat["count"]})
+        else:
+            tier = "⚠️ Practice Squad" if avg >= 50 else "🛑 Cut Day Risk"
+            weaknesses.append({"topic": t, "avg_score": avg, "grade": tier, "attempts": stat["count"]})
+
+    strengths.sort(key=lambda x: x["avg_score"], reverse=True)
+    weaknesses.sort(key=lambda x: x["avg_score"])
+
+    if weaknesses:
+        rec_topics = [w["topic"] for w in weaknesses[:2]]
+        rec = f"Focus your combine training on {', '.join(rec_topics)} where your average score is under 70."
+    elif strengths:
+        rec = "Exceptional performance across the board! You are performing at a First-Round Draft grade."
+    else:
+        rec = "Keep taking combine reps to establish statistical significance across all categories."
 
     return {
-        "status": "success",
-        "attempt": attempt,
-        "attempts_left": attempts_left,
-        "score": score,
-        "is_correct": is_correct,
-        "feedback": feedback,
-        "ideal_answer": visible_ideal_answer,
-        "has_attempts_remaining": attempts_left > 0 and not is_correct
+        "candidate": active_gm.username if active_gm else (f"Guest ({x_guest_id[:6]})" if x_guest_id else "Guest"),
+        "total_answers": len(answers),
+        "overall_avg_score": round(total_score / len(answers), 1),
+        "strengths": strengths,
+        "weaknesses": weaknesses,
+        "topic_breakdown": breakdown,
+        "recommendation": rec
     }
