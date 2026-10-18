@@ -43,7 +43,7 @@ else:
 
 connect_args = {"check_same_thread": False} if CLEAN_DB_URL.startswith("sqlite") else {}
 
-# pool_pre_ping=True prevents drops from idle cloud PostgreSQL connections
+# pool_pre_ping=True prevents stale connection crashes from cloud DB idle timeouts
 engine = create_engine(CLEAN_DB_URL, pool_pre_ping=True, connect_args=connect_args)
 DraftSessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
 DraftBase = declarative_base()
